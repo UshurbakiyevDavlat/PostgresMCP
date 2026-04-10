@@ -136,7 +136,22 @@ Expected output:
 ```bash
 cp /opt/PostgresMCP/deploy/nginx-postgres-mcp.conf /etc/nginx/sites-available/postgres-mcp
 ln -s /etc/nginx/sites-available/postgres-mcp /etc/nginx/sites-enabled/postgres-mcp
+```
 
+**Важно:** вставь токен в nginx конфиг перед проверкой:
+```bash
+# Токен должен совпадать с MCP_TOKEN из .env
+YOUR_TOKEN=$(grep MCP_TOKEN /opt/PostgresMCP/.env | cut -d= -f2)
+
+sed -i "s/REPLACE_WITH_YOUR_TOKEN/$YOUR_TOKEN/g" /etc/nginx/sites-available/postgres-mcp
+```
+
+Проверить что токен подставился:
+```bash
+grep arg_token /etc/nginx/sites-available/postgres-mcp
+```
+
+```bash
 # Test nginx config
 nginx -t
 
@@ -189,7 +204,8 @@ curl https://davlat-postgres.duckdns.org/mcp \
 ## Step 11 — Add to Claude Code (local)
 
 ```powershell
-claude mcp add --transport http postgres-mcp https://davlat-postgres.duckdns.org/mcp --header "Authorization: Bearer YOUR_MCP_TOKEN"
+# Токен передаётся как query param — так же как у knowledge-agent и linkedin-mcp
+claude mcp add --transport http postgres-mcp "https://davlat-postgres.duckdns.org/mcp?token=YOUR_MCP_TOKEN"
 ```
 
 ---

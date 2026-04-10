@@ -739,10 +739,16 @@ async function main(): Promise<void> {
         return;
       }
 
-      // -- Bearer token auth --
+      // -- Token auth (second line of defence after nginx) --
+      // Accepts: ?token=xxx (query param, same as knowledge-agent pattern)
+      //       OR Authorization: Bearer xxx (header, standard MCP clients)
       if (MCP_TOKEN) {
-        const authHeader = req.headers["authorization"] ?? "";
-        const token = authHeader.replace(/^Bearer\s+/i, "").trim();
+        const queryToken = reqUrl.searchParams.get("token") ?? "";
+        const bearerToken = (req.headers["authorization"] ?? "")
+          .replace(/^Bearer\s+/i, "")
+          .trim();
+        const token = queryToken || bearerToken;
+
         if (token !== MCP_TOKEN) {
           res.writeHead(401, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Unauthorized" }));
