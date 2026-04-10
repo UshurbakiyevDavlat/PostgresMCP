@@ -1,0 +1,5 @@
+{
+  "knowledge": "postgresql://agent:agentpass@localhost:5432/knowledge",
+  "shopdb":    "postgresql://user:pass@localhost:5432/shopdb",
+  "mps_prod":  "postgresql://user:pass@db-host:5432/mps"
+}

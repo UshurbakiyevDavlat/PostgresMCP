@@ -1,90 +1,144 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { Pool, type PoolConfig } from "pg";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { Pool } from "pg";
 import { z } from "zod";
+import * as fs from "fs";
+import * as path from "path";
+import * as http from "http";
+import { fileURLToPath } from "url";
+import { randomUUID } from "crypto";
+import type { IncomingMessage } from "http";
 
 // ============================================================================
-// PostgreSQL MCP Server
-// Provides Claude with read-only access to a PostgreSQL database.
-// Tools: pg_query, pg_list_tables, pg_describe_table, pg_explain_query,
-//        pg_table_stats, pg_list_indexes
+// PostgreSQL MCP Server v2
+//
+// Read-only PostgreSQL access with:
+//   - Named connections (connections.json) — switch DBs without restarting
+//   - Streamable HTTP transport for cloud deployment
+//   - stdio transport for local use
+//
+// Tools: pg_list_connections, pg_use_connection, pg_query, pg_list_tables,
+//        pg_describe_table, pg_explain_query, pg_table_stats, pg_list_indexes
 // ============================================================================
 
-// --- Database Connection ---
+// ============================================================================
+// Named Connections — loaded from connections.json
+// ============================================================================
 
-const DATABASE_URL = process.env.DATABASE_URL;
-if (!DATABASE_URL) {
-  console.error("ERROR: DATABASE_URL environment variable is required");
-  console.error("Example: DATABASE_URL=postgres://user:pass@localhost:5432/mydb");
-  process.exit(1);
+const CONNECTIONS_FILE =
+  process.env.CONNECTIONS_FILE ??
+  path.join(path.dirname(fileURLToPath(import.meta.url)), "../connections.json");
+
+type ConnectionsMap = Record<string, string>;
+
+function loadConnections(): ConnectionsMap {
+  try {
+    const raw = fs.readFileSync(CONNECTIONS_FILE, "utf-8");
+    const parsed = JSON.parse(raw) as ConnectionsMap;
+    if (Object.keys(parsed).length === 0) {
+      throw new Error("connections.json is empty");
+    }
+    return parsed;
+  } catch {
+    // Fallback: use DATABASE_URL env variable as a single "default" connection
+    const dbUrl = process.env.DATABASE_URL;
+    if (dbUrl) {
+      const name = process.env.DEFAULT_DB ?? "default";
+      console.error(`[postgres-mcp] connections.json not found — using DATABASE_URL as "${name}"`);
+      return { [name]: dbUrl };
+    }
+    throw new Error(
+      `Cannot start: ${CONNECTIONS_FILE} not found and DATABASE_URL not set.\n` +
+      `Create connections.json or set DATABASE_URL.`
+    );
+  }
 }
 
-const poolConfig: PoolConfig = {
-  connectionString: DATABASE_URL,
-  max: 5,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
-};
+const allConnections: ConnectionsMap = loadConnections();
 
-const pool = new Pool(poolConfig);
+// ============================================================================
+// Pool Management — lazy init, one Pool per named connection
+// ============================================================================
 
-// --- Safety: Read-Only Query Validator ---
+const poolCache = new Map<string, Pool>();
+
+function getPool(name: string): Pool {
+  if (poolCache.has(name)) return poolCache.get(name)!;
+
+  const connStr = allConnections[name];
+  if (!connStr) {
+    throw new Error(
+      `Connection "${name}" not found. Available: ${Object.keys(allConnections).join(", ")}`
+    );
+  }
+
+  const pool = new Pool({
+    connectionString: connStr,
+    max: 5,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000,
+  });
+
+  poolCache.set(name, pool);
+  return pool;
+}
+
+// Global active connection state
+// Single-user personal tool — global state is appropriate here.
+// If you need per-session isolation, wrap this in a session Map.
+let activeDbName: string = process.env.DEFAULT_DB ?? Object.keys(allConnections)[0];
+
+function getActivePool(): Pool {
+  return getPool(activeDbName);
+}
+
+// ============================================================================
+// Safety — Read-Only Query Validator
+// ============================================================================
 
 const DANGEROUS_KEYWORDS = [
-  "INSERT",
-  "UPDATE",
-  "DELETE",
-  "DROP",
-  "ALTER",
-  "TRUNCATE",
-  "CREATE",
-  "GRANT",
-  "REVOKE",
-  "VACUUM",
-  "REINDEX",
-  "CLUSTER",
-  "COPY",
+  "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE",
+  "CREATE", "GRANT", "REVOKE", "VACUUM", "REINDEX", "CLUSTER", "COPY",
 ];
 
 function isSafeQuery(sql: string): { safe: boolean; reason?: string } {
   const normalized = sql
-    .replace(/--.*$/gm, "") // Remove single-line comments
-    .replace(/\/\*[\s\S]*?\*\//g, "") // Remove block comments
-    .replace(/('([^'\\]|\\.)*')/g, "") // Remove string literals
+    .replace(/--.*$/gm, "")           // strip line comments
+    .replace(/\/\*[\s\S]*?\*\//g, "") // strip block comments
+    .replace(/('([^'\\]|\\.)*')/g, "") // strip string literals
     .toUpperCase()
     .trim();
 
-  for (const keyword of DANGEROUS_KEYWORDS) {
-    // Match keyword at word boundary to avoid false positives
-    const regex = new RegExp(`\\b${keyword}\\b`);
-    if (regex.test(normalized)) {
+  for (const kw of DANGEROUS_KEYWORDS) {
+    if (new RegExp(`\\b${kw}\\b`).test(normalized)) {
       return {
         safe: false,
-        reason: `Query contains forbidden keyword: ${keyword}. Only SELECT/WITH queries are allowed.`,
+        reason: `Forbidden keyword: ${kw}. Only SELECT/WITH queries are allowed.`,
       };
     }
   }
 
-  // Must start with SELECT or WITH (CTE)
   if (!normalized.startsWith("SELECT") && !normalized.startsWith("WITH")) {
     return {
       safe: false,
-      reason:
-        "Query must start with SELECT or WITH. Only read-only queries are allowed.",
+      reason: "Query must start with SELECT or WITH. Only read-only queries are allowed.",
     };
   }
 
   return { safe: true };
 }
 
-// --- Helper: Execute Query with Timeout ---
+// ============================================================================
+// Helper — Execute Query with Timeout
+// ============================================================================
 
 async function executeQuery(
   sql: string,
   params?: unknown[],
-  timeoutMs: number = 30000
+  timeoutMs = 30000
 ): Promise<{ rows: Record<string, unknown>[]; rowCount: number; fields: string[] }> {
-  const client = await pool.connect();
+  const client = await getActivePool().connect();
   try {
     await client.query(`SET statement_timeout = ${timeoutMs}`);
     const result = await client.query(sql, params);
@@ -98,584 +152,703 @@ async function executeQuery(
   }
 }
 
-// --- MCP Server Setup ---
-
-const server = new McpServer({
-  name: "postgres-mcp-server",
-  version: "1.0.0",
-});
-
 // ============================================================================
-// Tool 1: pg_query — Execute read-only SQL queries
+// Tool Registration — called once per McpServer instance
 // ============================================================================
 
-server.registerTool(
-  "pg_query",
-  {
-    title: "Query PostgreSQL Database",
-    description: `Execute a read-only SQL query against the PostgreSQL database.
+function registerAllTools(server: McpServer): void {
 
-ONLY SELECT and WITH (CTE) queries are allowed. INSERT, UPDATE, DELETE, DROP,
-ALTER, and other write operations are blocked for safety.
-
-Args:
-  - sql (string): The SQL query to execute. Must be a SELECT or WITH statement.
-  - limit (number): Maximum rows to return (default: 100, max: 1000).
-
-Returns:
-  Query results as a table with column names and row data.
-
-Examples:
-  - "SELECT * FROM users WHERE created_at > '2024-01-01' LIMIT 10"
-  - "WITH active AS (SELECT * FROM users WHERE active = true) SELECT count(*) FROM active"
-
-Error Handling:
-  - Returns error if query contains write operations
-  - Returns error if query times out (30s limit)
-  - Returns error if syntax is invalid`,
-    inputSchema: {
-      sql: z
-        .string()
-        .min(1, "SQL query cannot be empty")
-        .max(10000, "SQL query too long (max 10000 chars)")
-        .describe("SQL SELECT query to execute"),
-      limit: z
-        .number()
-        .int()
-        .min(1)
-        .max(1000)
-        .default(100)
-        .describe("Maximum rows to return (default: 100)"),
+  // --------------------------------------------------------------------------
+  // pg_list_connections — list available named connections
+  // --------------------------------------------------------------------------
+  server.registerTool(
+    "pg_list_connections",
+    {
+      title: "List Database Connections",
+      description: `List all available named PostgreSQL connections and show which one is currently active.
+Returns names only — credentials are never exposed.
+Use pg_use_connection to switch to a different database.`,
+      inputSchema: {},
+      annotations: { readOnlyHint: true, destructiveHint: false },
     },
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  },
-  async ({ sql, limit }) => {
-    // Safety check
-    const safety = isSafeQuery(sql);
-    if (!safety.safe) {
-      return {
-        content: [{ type: "text", text: `⛔ Blocked: ${safety.reason}` }],
-        isError: true,
-      };
-    }
-
-    // Add LIMIT if not present
-    const normalizedSql = sql.toUpperCase();
-    const finalSql =
-      normalizedSql.includes("LIMIT") ? sql : `${sql} LIMIT ${limit}`;
-
-    try {
-      const result = await executeQuery(finalSql);
-
-      if (result.rows.length === 0) {
-        return {
-          content: [{ type: "text", text: "Query returned 0 rows." }],
-        };
-      }
-
-      // Format as markdown table
-      const headers = result.fields;
-      const headerLine = `| ${headers.join(" | ")} |`;
-      const separatorLine = `| ${headers.map(() => "---").join(" | ")} |`;
-      const dataLines = result.rows.map(
-        (row) =>
-          `| ${headers.map((h) => {
-            const val = row[h];
-            if (val === null) return "NULL";
-            if (typeof val === "object") return JSON.stringify(val);
-            return String(val);
-          }).join(" | ")} |`
-      );
-
-      const table = [
-        `**${result.rowCount} rows returned** (fields: ${headers.length})`,
+    async () => {
+      const names = Object.keys(allConnections);
+      const lines = [
+        "# PostgreSQL Connections",
         "",
-        headerLine,
-        separatorLine,
-        ...dataLines,
-      ].join("\n");
-
-      return { content: [{ type: "text", text: table }] };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: "text", text: `Query error: ${msg}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// ============================================================================
-// Tool 2: pg_list_tables — List all tables with row counts
-// ============================================================================
-
-server.registerTool(
-  "pg_list_tables",
-  {
-    title: "List Database Tables",
-    description: `List all tables in the database with their schemas, row counts, and sizes.
-
-Args:
-  - schema (string): Schema to list tables from (default: 'public')
-
-Returns:
-  Table listing with name, estimated row count, and disk size.`,
-    inputSchema: {
-      schema: z
-        .string()
-        .default("public")
-        .describe("Schema name (default: public)"),
-    },
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  },
-  async ({ schema }) => {
-    try {
-      const result = await executeQuery(
-        `SELECT
-          t.tablename AS table_name,
-          pg_size_pretty(pg_total_relation_size(quote_ident(t.schemaname) || '.' || quote_ident(t.tablename))) AS total_size,
-          COALESCE(s.n_live_tup, 0) AS estimated_rows,
-          obj_description((quote_ident(t.schemaname) || '.' || quote_ident(t.tablename))::regclass) AS comment
-        FROM pg_tables t
-        LEFT JOIN pg_stat_user_tables s
-          ON t.schemaname = s.schemaname AND t.tablename = s.relname
-        WHERE t.schemaname = $1
-        ORDER BY COALESCE(s.n_live_tup, 0) DESC`,
-        [schema]
-      );
-
-      if (result.rows.length === 0) {
-        return {
-          content: [{ type: "text", text: `No tables found in schema '${schema}'.` }],
-        };
-      }
-
-      const lines = [`# Tables in schema '${schema}'`, "", `Found ${result.rows.length} tables:`, ""];
-      lines.push("| Table | Rows (est.) | Size | Comment |");
-      lines.push("| --- | --- | --- | --- |");
-
-      for (const row of result.rows) {
-        lines.push(
-          `| ${row.table_name} | ${Number(row.estimated_rows).toLocaleString()} | ${row.total_size} | ${row.comment || "—"} |`
-        );
-      }
-
+        `**Active:** ${activeDbName}`,
+        "",
+        "| Name | Status |",
+        "| --- | --- |",
+        ...names.map((n) => `| ${n} | ${n === activeDbName ? "✅ active" : "—"} |`),
+        "",
+        "Use `pg_use_connection(name)` to switch databases.",
+      ];
       return { content: [{ type: "text", text: lines.join("\n") }] };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: "text", text: `Error listing tables: ${msg}` }],
-        isError: true,
-      };
     }
-  }
-);
+  );
 
-// ============================================================================
-// Tool 3: pg_describe_table — Show table structure
-// ============================================================================
-
-server.registerTool(
-  "pg_describe_table",
-  {
-    title: "Describe Table Structure",
-    description: `Show the full structure of a table: columns, types, constraints, defaults, and foreign keys.
+  // --------------------------------------------------------------------------
+  // pg_use_connection — switch active database
+  // --------------------------------------------------------------------------
+  server.registerTool(
+    "pg_use_connection",
+    {
+      title: "Switch Active Database Connection",
+      description: `Switch the active PostgreSQL connection by name.
+All subsequent tool calls will run against the new database.
+The switch is verified with a test query — reverts automatically if connection fails.
 
 Args:
-  - table (string): Table name to describe
-  - schema (string): Schema name (default: 'public')
-
-Returns:
-  Detailed table structure with column definitions, primary keys, foreign keys, and indexes.`,
-    inputSchema: {
-      table: z.string().min(1).describe("Table name to describe"),
-      schema: z
-        .string()
-        .default("public")
-        .describe("Schema name (default: public)"),
+  - name: Connection name (from pg_list_connections)`,
+      inputSchema: {
+        name: z.string().min(1).describe("Connection name to activate"),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false },
     },
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  },
-  async ({ table, schema }) => {
-    try {
-      // Columns
-      const columns = await executeQuery(
-        `SELECT
-          c.column_name,
-          c.data_type,
-          c.character_maximum_length,
-          c.is_nullable,
-          c.column_default,
-          col_description((quote_ident($2) || '.' || quote_ident($1))::regclass, c.ordinal_position) AS comment
-        FROM information_schema.columns c
-        WHERE c.table_schema = $2 AND c.table_name = $1
-        ORDER BY c.ordinal_position`,
-        [table, schema]
-      );
-
-      if (columns.rows.length === 0) {
+    async ({ name }) => {
+      if (!allConnections[name]) {
         return {
-          content: [{ type: "text", text: `Table '${schema}.${table}' not found.` }],
+          content: [{
+            type: "text",
+            text: `⛔ Connection "${name}" not found.\nAvailable: ${Object.keys(allConnections).join(", ")}`,
+          }],
           isError: true,
         };
       }
 
-      // Primary key
-      const pk = await executeQuery(
-        `SELECT kcu.column_name
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu
-          ON tc.constraint_name = kcu.constraint_name
-        WHERE tc.table_schema = $2 AND tc.table_name = $1 AND tc.constraint_type = 'PRIMARY KEY'
-        ORDER BY kcu.ordinal_position`,
-        [table, schema]
-      );
+      const previous = activeDbName;
+      activeDbName = name;
 
-      // Foreign keys
-      const fks = await executeQuery(
-        `SELECT
-          kcu.column_name,
-          ccu.table_schema AS ref_schema,
-          ccu.table_name AS ref_table,
-          ccu.column_name AS ref_column
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu
-          ON tc.constraint_name = kcu.constraint_name
-        JOIN information_schema.constraint_column_usage ccu
-          ON tc.constraint_name = ccu.constraint_name
-        WHERE tc.table_schema = $2 AND tc.table_name = $1 AND tc.constraint_type = 'FOREIGN KEY'`,
-        [table, schema]
-      );
+      try {
+        const result = await executeQuery("SELECT current_database(), version()");
+        const row = result.rows[0];
+        const shortVersion = String(row.version).split(",")[0]; // e.g. "PostgreSQL 17.4"
+        return {
+          content: [{
+            type: "text",
+            text: `✅ Switched: **${previous}** → **${name}**\nDatabase: ${row.current_database}\nServer: ${shortVersion}`,
+          }],
+        };
+      } catch (error) {
+        activeDbName = previous; // revert
+        const msg = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{
+            type: "text",
+            text: `⛔ Cannot connect to "${name}": ${msg}\nReverted to "${previous}".`,
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
 
-      // Indexes
-      const indexes = await executeQuery(
-        `SELECT indexname, indexdef
-        FROM pg_indexes
-        WHERE schemaname = $2 AND tablename = $1`,
-        [table, schema]
-      );
+  // --------------------------------------------------------------------------
+  // pg_query — execute read-only SQL
+  // --------------------------------------------------------------------------
+  server.registerTool(
+    "pg_query",
+    {
+      title: "Query PostgreSQL Database",
+      description: `Execute a read-only SQL query against the active database.
+Only SELECT and WITH (CTE) statements are allowed — writes are blocked.
 
-      // Format output
-      const pkCols = new Set(pk.rows.map((r) => r.column_name));
-      const fkMap = new Map(
-        fks.rows.map((r) => [
-          r.column_name as string,
-          `→ ${r.ref_schema}.${r.ref_table}.${r.ref_column}`,
-        ])
-      );
+Args:
+  - sql: SELECT or WITH query (max 10 000 chars)
+  - limit: Max rows to return (default 100, max 1000)
 
-      const lines = [`# Table: ${schema}.${table}`, ""];
-      lines.push("## Columns", "");
-      lines.push("| Column | Type | Nullable | Default | PK | FK | Comment |");
-      lines.push("| --- | --- | --- | --- | --- | --- | --- |");
-
-      for (const col of columns.rows) {
-        const typeName = col.character_maximum_length
-          ? `${col.data_type}(${col.character_maximum_length})`
-          : String(col.data_type);
-
-        lines.push(
-          `| ${col.column_name} | ${typeName} | ${col.is_nullable} | ${col.column_default || "—"} | ${pkCols.has(col.column_name as string) ? "✅" : ""} | ${fkMap.get(col.column_name as string) || ""} | ${col.comment || ""} |`
-        );
+Tip: use pg_use_connection first to switch databases.`,
+      inputSchema: {
+        sql: z
+          .string()
+          .min(1, "SQL cannot be empty")
+          .max(10000, "SQL too long")
+          .describe("SQL SELECT/WITH query"),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(1000)
+          .default(100)
+          .describe("Max rows to return (default 100)"),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ sql, limit }) => {
+      const safety = isSafeQuery(sql);
+      if (!safety.safe) {
+        return {
+          content: [{ type: "text", text: `⛔ Blocked: ${safety.reason}` }],
+          isError: true,
+        };
       }
 
-      if (indexes.rows.length > 0) {
-        lines.push("", "## Indexes", "");
-        for (const idx of indexes.rows) {
-          lines.push(`- **${idx.indexname}**: \`${idx.indexdef}\``);
+      const finalSql = sql.toUpperCase().includes("LIMIT") ? sql : `${sql} LIMIT ${limit}`;
+
+      try {
+        const result = await executeQuery(finalSql);
+
+        if (result.rows.length === 0) {
+          return {
+            content: [{ type: "text", text: `Query returned 0 rows. [db: ${activeDbName}]` }],
+          };
+        }
+
+        const headers = result.fields;
+        const table = [
+          `**${result.rowCount} rows** from \`${activeDbName}\` (${headers.length} columns)`,
+          "",
+          `| ${headers.join(" | ")} |`,
+          `| ${headers.map(() => "---").join(" | ")} |`,
+          ...result.rows.map(
+            (row) =>
+              `| ${headers
+                .map((h) => {
+                  const v = row[h];
+                  if (v === null) return "NULL";
+                  if (typeof v === "object") return JSON.stringify(v);
+                  return String(v);
+                })
+                .join(" | ")} |`
+          ),
+        ].join("\n");
+
+        return { content: [{ type: "text", text: table }] };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text", text: `Query error: ${msg}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // --------------------------------------------------------------------------
+  // pg_list_tables — list tables with sizes and row counts
+  // --------------------------------------------------------------------------
+  server.registerTool(
+    "pg_list_tables",
+    {
+      title: "List Database Tables",
+      description: `List all tables in the active database with estimated row counts and disk sizes.
+
+Args:
+  - schema: Schema name (default: public)`,
+      inputSchema: {
+        schema: z.string().default("public").describe("Schema name (default: public)"),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ schema }) => {
+      try {
+        const result = await executeQuery(
+          `SELECT
+            t.tablename AS table_name,
+            pg_size_pretty(pg_total_relation_size(
+              quote_ident(t.schemaname) || '.' || quote_ident(t.tablename)
+            )) AS total_size,
+            COALESCE(s.n_live_tup, 0) AS estimated_rows,
+            obj_description((
+              quote_ident(t.schemaname) || '.' || quote_ident(t.tablename)
+            )::regclass) AS comment
+          FROM pg_tables t
+          LEFT JOIN pg_stat_user_tables s
+            ON t.schemaname = s.schemaname AND t.tablename = s.relname
+          WHERE t.schemaname = $1
+          ORDER BY COALESCE(s.n_live_tup, 0) DESC`,
+          [schema]
+        );
+
+        if (result.rows.length === 0) {
+          return {
+            content: [{ type: "text", text: `No tables in schema '${schema}'. [db: ${activeDbName}]` }],
+          };
+        }
+
+        const lines = [
+          `# Tables in \`${activeDbName}\` / schema \`${schema}\``,
+          "",
+          `${result.rows.length} table(s):`,
+          "",
+          "| Table | Rows (est.) | Total Size | Comment |",
+          "| --- | --- | --- | --- |",
+          ...result.rows.map(
+            (r) =>
+              `| ${r.table_name} | ${Number(r.estimated_rows).toLocaleString()} | ${r.total_size} | ${r.comment ?? "—"} |`
+          ),
+        ];
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
+      }
+    }
+  );
+
+  // --------------------------------------------------------------------------
+  // pg_describe_table — columns, types, constraints, indexes
+  // --------------------------------------------------------------------------
+  server.registerTool(
+    "pg_describe_table",
+    {
+      title: "Describe Table Structure",
+      description: `Show the full structure of a table: columns, data types, nullability, defaults,
+primary key, foreign keys, and indexes.
+
+Args:
+  - table: Table name
+  - schema: Schema name (default: public)`,
+      inputSchema: {
+        table: z.string().min(1).describe("Table name"),
+        schema: z.string().default("public").describe("Schema name (default: public)"),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ table, schema }) => {
+      try {
+        const columns = await executeQuery(
+          `SELECT
+            c.column_name, c.data_type, c.character_maximum_length,
+            c.is_nullable, c.column_default,
+            col_description(
+              (quote_ident($2) || '.' || quote_ident($1))::regclass,
+              c.ordinal_position
+            ) AS comment
+          FROM information_schema.columns c
+          WHERE c.table_schema = $2 AND c.table_name = $1
+          ORDER BY c.ordinal_position`,
+          [table, schema]
+        );
+
+        if (columns.rows.length === 0) {
+          return {
+            content: [{ type: "text", text: `Table '${schema}.${table}' not found in '${activeDbName}'.` }],
+            isError: true,
+          };
+        }
+
+        const pk = await executeQuery(
+          `SELECT kcu.column_name
+          FROM information_schema.table_constraints tc
+          JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+          WHERE tc.table_schema = $2 AND tc.table_name = $1
+            AND tc.constraint_type = 'PRIMARY KEY'
+          ORDER BY kcu.ordinal_position`,
+          [table, schema]
+        );
+
+        const fks = await executeQuery(
+          `SELECT
+            kcu.column_name,
+            ccu.table_schema AS ref_schema,
+            ccu.table_name AS ref_table,
+            ccu.column_name AS ref_column
+          FROM information_schema.table_constraints tc
+          JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+          JOIN information_schema.constraint_column_usage ccu
+            ON tc.constraint_name = ccu.constraint_name
+          WHERE tc.table_schema = $2 AND tc.table_name = $1
+            AND tc.constraint_type = 'FOREIGN KEY'`,
+          [table, schema]
+        );
+
+        const indexes = await executeQuery(
+          `SELECT indexname, indexdef
+          FROM pg_indexes
+          WHERE schemaname = $2 AND tablename = $1`,
+          [table, schema]
+        );
+
+        const pkCols = new Set(pk.rows.map((r) => r.column_name));
+        const fkMap = new Map(
+          fks.rows.map((r) => [
+            r.column_name as string,
+            `→ ${r.ref_schema}.${r.ref_table}.${r.ref_column}`,
+          ])
+        );
+
+        const lines = [`# Table: ${schema}.${table} [${activeDbName}]`, ""];
+        lines.push("## Columns", "");
+        lines.push("| Column | Type | Nullable | Default | PK | FK | Comment |");
+        lines.push("| --- | --- | --- | --- | --- | --- | --- |");
+
+        for (const col of columns.rows) {
+          const typeName = col.character_maximum_length
+            ? `${col.data_type}(${col.character_maximum_length})`
+            : String(col.data_type);
+
+          lines.push(
+            `| ${col.column_name} | ${typeName} | ${col.is_nullable} | ${col.column_default ?? "—"} | ${pkCols.has(col.column_name as string) ? "✅" : ""} | ${fkMap.get(col.column_name as string) ?? ""} | ${col.comment ?? ""} |`
+          );
+        }
+
+        if (indexes.rows.length > 0) {
+          lines.push("", "## Indexes", "");
+          for (const idx of indexes.rows) {
+            lines.push(`- **${idx.indexname}**: \`${idx.indexdef}\``);
+          }
+        }
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
+      }
+    }
+  );
+
+  // --------------------------------------------------------------------------
+  // pg_explain_query — EXPLAIN ANALYZE
+  // --------------------------------------------------------------------------
+  server.registerTool(
+    "pg_explain_query",
+    {
+      title: "Explain Query Plan",
+      description: `Run EXPLAIN ANALYZE on a SELECT query to show the execution plan with actual timings.
+Useful for understanding and optimizing query performance.
+
+Args:
+  - sql: SQL SELECT query to analyze`,
+      inputSchema: {
+        sql: z.string().min(1).max(10000).describe("SQL SELECT query to explain"),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false },
+    },
+    async ({ sql }) => {
+      const safety = isSafeQuery(sql);
+      if (!safety.safe) {
+        return {
+          content: [{ type: "text", text: `⛔ Blocked: ${safety.reason}` }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await executeQuery(`EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) ${sql}`);
+        const plan = result.rows.map((r) => Object.values(r)[0]).join("\n");
+        return {
+          content: [{
+            type: "text",
+            text: `# Query Plan [${activeDbName}]\n\n\`\`\`\n${plan}\n\`\`\`\n\n**Query:**\n\`\`\`sql\n${sql}\n\`\`\``,
+          }],
+        };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return { content: [{ type: "text", text: `Explain error: ${msg}` }], isError: true };
+      }
+    }
+  );
+
+  // --------------------------------------------------------------------------
+  // pg_table_stats — vacuum, row counts, scan usage
+  // --------------------------------------------------------------------------
+  server.registerTool(
+    "pg_table_stats",
+    {
+      title: "Table Statistics",
+      description: `Show detailed statistics for a table: sizes, live/dead rows, insert/update/delete counts,
+sequential vs index scan usage, and vacuum/analyze timestamps.
+
+Args:
+  - table: Table name
+  - schema: Schema name (default: public)`,
+      inputSchema: {
+        table: z.string().min(1).describe("Table name"),
+        schema: z.string().default("public").describe("Schema name"),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ table, schema }) => {
+      try {
+        const result = await executeQuery(
+          `SELECT
+            n_live_tup AS live_rows, n_dead_tup AS dead_rows,
+            n_tup_ins AS total_inserts, n_tup_upd AS total_updates, n_tup_del AS total_deletes,
+            seq_scan, seq_tup_read, idx_scan, idx_tup_fetch,
+            last_vacuum, last_autovacuum, last_analyze, last_autoanalyze,
+            pg_size_pretty(pg_total_relation_size(
+              quote_ident($2) || '.' || quote_ident($1)
+            )) AS total_size,
+            pg_size_pretty(pg_relation_size(
+              quote_ident($2) || '.' || quote_ident($1)
+            )) AS table_size,
+            pg_size_pretty(pg_indexes_size(
+              (quote_ident($2) || '.' || quote_ident($1))::regclass
+            )) AS indexes_size
+          FROM pg_stat_user_tables
+          WHERE schemaname = $2 AND relname = $1`,
+          [table, schema]
+        );
+
+        if (result.rows.length === 0) {
+          return {
+            content: [{ type: "text", text: `Table '${schema}.${table}' not found in stats. [db: ${activeDbName}]` }],
+            isError: true,
+          };
+        }
+
+        const s = result.rows[0];
+        const lines = [
+          `# Stats: ${schema}.${table} [${activeDbName}]`,
+          "",
+          "## Size",
+          `- **Total:** ${s.total_size} | **Table:** ${s.table_size} | **Indexes:** ${s.indexes_size}`,
+          "",
+          "## Row Activity",
+          `- **Live rows:** ${Number(s.live_rows).toLocaleString()} | **Dead rows:** ${Number(s.dead_rows).toLocaleString()}`,
+          `- **Inserts:** ${Number(s.total_inserts).toLocaleString()} | **Updates:** ${Number(s.total_updates).toLocaleString()} | **Deletes:** ${Number(s.total_deletes).toLocaleString()}`,
+          "",
+          "## Scan Usage",
+          `- **Seq scans:** ${Number(s.seq_scan).toLocaleString()} (read ${Number(s.seq_tup_read).toLocaleString()} rows)`,
+          `- **Index scans:** ${Number(s.idx_scan).toLocaleString()} (fetched ${Number(s.idx_tup_fetch).toLocaleString()} rows)`,
+          "",
+          "## Maintenance",
+          `- **Last vacuum:** ${s.last_vacuum ?? "never"} | **Last autovacuum:** ${s.last_autovacuum ?? "never"}`,
+          `- **Last analyze:** ${s.last_analyze ?? "never"} | **Last autoanalyze:** ${s.last_autoanalyze ?? "never"}`,
+        ];
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
+      }
+    }
+  );
+
+  // --------------------------------------------------------------------------
+  // pg_list_indexes — index definitions, sizes, usage stats
+  // --------------------------------------------------------------------------
+  server.registerTool(
+    "pg_list_indexes",
+    {
+      title: "List Table Indexes",
+      description: `List all indexes on a table with their definitions, disk sizes, and usage statistics (scan counts).
+
+Args:
+  - table: Table name
+  - schema: Schema name (default: public)`,
+      inputSchema: {
+        table: z.string().min(1).describe("Table name"),
+        schema: z.string().default("public").describe("Schema name"),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ table, schema }) => {
+      try {
+        const result = await executeQuery(
+          `SELECT
+            i.indexname, i.indexdef,
+            pg_size_pretty(pg_relation_size(
+              quote_ident(i.schemaname) || '.' || quote_ident(i.indexname)
+            )) AS index_size,
+            COALESCE(s.idx_scan, 0) AS scan_count,
+            COALESCE(s.idx_tup_read, 0) AS tuples_read,
+            COALESCE(s.idx_tup_fetch, 0) AS tuples_fetched
+          FROM pg_indexes i
+          LEFT JOIN pg_stat_user_indexes s
+            ON i.schemaname = s.schemaname AND i.indexname = s.indexrelname
+          WHERE i.schemaname = $2 AND i.tablename = $1
+          ORDER BY COALESCE(s.idx_scan, 0) DESC`,
+          [table, schema]
+        );
+
+        if (result.rows.length === 0) {
+          return {
+            content: [{ type: "text", text: `No indexes on '${schema}.${table}'. [db: ${activeDbName}]` }],
+          };
+        }
+
+        const lines = [
+          `# Indexes: ${schema}.${table} [${activeDbName}]`,
+          "",
+          `${result.rows.length} index(es):`,
+          "",
+        ];
+
+        for (const idx of result.rows) {
+          lines.push(`### ${idx.indexname}`);
+          lines.push(`- **Size:** ${idx.index_size} | **Scans:** ${Number(idx.scan_count).toLocaleString()} | **Tuples read:** ${Number(idx.tuples_read).toLocaleString()}`);
+          lines.push(`- **Def:** \`${idx.indexdef}\``);
+          lines.push("");
+        }
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
+      }
+    }
+  );
+}
+
+// ============================================================================
+// HTTP body parser helper
+// ============================================================================
+
+function parseBody(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      try {
+        resolve(body ? JSON.parse(body) : undefined);
+      } catch (e) {
+        reject(e);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+// ============================================================================
+// Main — stdio or HTTP transport based on TRANSPORT env var
+// ============================================================================
+
+async function main(): Promise<void> {
+  const transport_mode = process.env.TRANSPORT ?? "stdio";
+
+  if (transport_mode === "http") {
+    // -------------------------------------------------------------------------
+    // HTTP mode — Streamable HTTP transport for cloud/remote deployment
+    // Endpoint: POST/GET/DELETE /mcp
+    // Health:   GET /health
+    // Auth:     Bearer token via MCP_TOKEN env (optional)
+    // -------------------------------------------------------------------------
+    const PORT = parseInt(process.env.PORT ?? "3200");
+    const MCP_TOKEN = process.env.MCP_TOKEN;
+
+    // Session map: mcp-session-id → transport
+    const transports = new Map<string, StreamableHTTPServerTransport>();
+
+    const httpServer = http.createServer(async (req, res) => {
+      const reqUrl = new URL(req.url ?? "/", `http://localhost`);
+
+      // -- Health check (no auth) --
+      if (reqUrl.pathname === "/health" && req.method === "GET") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          status: "ok",
+          activeDb: activeDbName,
+          connections: Object.keys(allConnections),
+          sessions: transports.size,
+        }));
+        return;
+      }
+
+      // -- Bearer token auth --
+      if (MCP_TOKEN) {
+        const authHeader = req.headers["authorization"] ?? "";
+        const token = authHeader.replace(/^Bearer\s+/i, "").trim();
+        if (token !== MCP_TOKEN) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unauthorized" }));
+          return;
         }
       }
 
-      return { content: [{ type: "text", text: lines.join("\n") }] };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: "text", text: `Error describing table: ${msg}` }],
-        isError: true,
-      };
-    }
-  }
-);
+      // -- MCP endpoint --
+      if (reqUrl.pathname === "/mcp") {
+        const sessionId = req.headers["mcp-session-id"] as string | undefined;
+        let transport: StreamableHTTPServerTransport;
 
-// ============================================================================
-// Tool 4: pg_explain_query — Show query execution plan
-// ============================================================================
+        if (sessionId && transports.has(sessionId)) {
+          // Existing session — reuse transport
+          transport = transports.get(sessionId)!;
+        } else if (!sessionId && req.method === "POST") {
+          // New session — initialize
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+          });
 
-server.registerTool(
-  "pg_explain_query",
-  {
-    title: "Explain Query Plan",
-    description: `Show the execution plan for a SQL query using EXPLAIN ANALYZE.
-Useful for understanding query performance and optimization.
+          transport.onclose = () => {
+            const sid = transport.sessionId;
+            if (sid) transports.delete(sid);
+            console.error(`[postgres-mcp] Session closed: ${sid}`);
+          };
 
-Args:
-  - sql (string): The SQL SELECT query to explain
+          const mcpServer = new McpServer({
+            name: "postgres-mcp-server",
+            version: "2.0.0",
+          });
+          registerAllTools(mcpServer);
+          await mcpServer.connect(transport);
 
-Returns:
-  The query execution plan with timing and cost estimates.`,
-    inputSchema: {
-      sql: z
-        .string()
-        .min(1)
-        .max(10000)
-        .describe("SQL SELECT query to explain"),
-    },
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: false, // ANALYZE actually executes
-      openWorldHint: false,
-    },
-  },
-  async ({ sql }) => {
-    const safety = isSafeQuery(sql);
-    if (!safety.safe) {
-      return {
-        content: [{ type: "text", text: `⛔ Blocked: ${safety.reason}` }],
-        isError: true,
-      };
-    }
+          const sid = transport.sessionId;
+          if (sid) {
+            transports.set(sid, transport);
+            console.error(`[postgres-mcp] New session: ${sid} | db: ${activeDbName}`);
+          }
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Bad Request: provide mcp-session-id header for existing sessions" }));
+          return;
+        }
 
-    try {
-      const result = await executeQuery(
-        `EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) ${sql}`
-      );
+        // Parse body for POST requests
+        let parsedBody: unknown;
+        if (req.method === "POST") {
+          try {
+            parsedBody = await parseBody(req);
+          } catch {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Invalid JSON body" }));
+            return;
+          }
+        }
 
-      const plan = result.rows
-        .map((r) => Object.values(r)[0])
-        .join("\n");
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `# Query Plan\n\n\`\`\`\n${plan}\n\`\`\`\n\n**Original query:**\n\`\`\`sql\n${sql}\n\`\`\``,
-          },
-        ],
-      };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: "text", text: `Explain error: ${msg}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// ============================================================================
-// Tool 5: pg_table_stats — Show table statistics
-// ============================================================================
-
-server.registerTool(
-  "pg_table_stats",
-  {
-    title: "Table Statistics",
-    description: `Show detailed statistics for a table: row count, dead tuples, last vacuum/analyze times, and sequential vs index scan usage.
-
-Args:
-  - table (string): Table name
-  - schema (string): Schema name (default: 'public')
-
-Returns:
-  Table health statistics useful for performance analysis.`,
-    inputSchema: {
-      table: z.string().min(1).describe("Table name"),
-      schema: z.string().default("public").describe("Schema name"),
-    },
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  },
-  async ({ table, schema }) => {
-    try {
-      const result = await executeQuery(
-        `SELECT
-          n_live_tup AS live_rows,
-          n_dead_tup AS dead_rows,
-          n_tup_ins AS total_inserts,
-          n_tup_upd AS total_updates,
-          n_tup_del AS total_deletes,
-          seq_scan,
-          seq_tup_read,
-          idx_scan,
-          idx_tup_fetch,
-          last_vacuum,
-          last_autovacuum,
-          last_analyze,
-          last_autoanalyze,
-          pg_size_pretty(pg_total_relation_size(quote_ident($2) || '.' || quote_ident($1))) AS total_size,
-          pg_size_pretty(pg_relation_size(quote_ident($2) || '.' || quote_ident($1))) AS table_size,
-          pg_size_pretty(pg_indexes_size((quote_ident($2) || '.' || quote_ident($1))::regclass)) AS indexes_size
-        FROM pg_stat_user_tables
-        WHERE schemaname = $2 AND relname = $1`,
-        [table, schema]
-      );
-
-      if (result.rows.length === 0) {
-        return {
-          content: [{ type: "text", text: `Table '${schema}.${table}' not found in statistics.` }],
-          isError: true,
-        };
+        await transport.handleRequest(req, res, parsedBody);
+        return;
       }
 
-      const s = result.rows[0];
-      const lines = [
-        `# Statistics: ${schema}.${table}`,
-        "",
-        "## Size",
-        `- **Total size:** ${s.total_size}`,
-        `- **Table data:** ${s.table_size}`,
-        `- **Indexes:** ${s.indexes_size}`,
-        "",
-        "## Row Activity",
-        `- **Live rows:** ${Number(s.live_rows).toLocaleString()}`,
-        `- **Dead rows:** ${Number(s.dead_rows).toLocaleString()}`,
-        `- **Total inserts:** ${Number(s.total_inserts).toLocaleString()}`,
-        `- **Total updates:** ${Number(s.total_updates).toLocaleString()}`,
-        `- **Total deletes:** ${Number(s.total_deletes).toLocaleString()}`,
-        "",
-        "## Scan Usage",
-        `- **Sequential scans:** ${Number(s.seq_scan).toLocaleString()} (read ${Number(s.seq_tup_read).toLocaleString()} rows)`,
-        `- **Index scans:** ${Number(s.idx_scan).toLocaleString()} (fetched ${Number(s.idx_tup_fetch).toLocaleString()} rows)`,
-        "",
-        "## Maintenance",
-        `- **Last vacuum:** ${s.last_vacuum || "never"}`,
-        `- **Last autovacuum:** ${s.last_autovacuum || "never"}`,
-        `- **Last analyze:** ${s.last_analyze || "never"}`,
-        `- **Last autoanalyze:** ${s.last_autoanalyze || "never"}`,
-      ];
+      res.writeHead(404);
+      res.end("Not Found");
+    });
 
-      return { content: [{ type: "text", text: lines.join("\n") }] };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: "text", text: `Error: ${msg}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// ============================================================================
-// Tool 6: pg_list_indexes — List all indexes for a table
-// ============================================================================
-
-server.registerTool(
-  "pg_list_indexes",
-  {
-    title: "List Table Indexes",
-    description: `List all indexes on a table with their definitions, sizes, and usage statistics.
-
-Args:
-  - table (string): Table name
-  - schema (string): Schema name (default: 'public')
-
-Returns:
-  Index listing with definitions, sizes, and scan counts.`,
-    inputSchema: {
-      table: z.string().min(1).describe("Table name"),
-      schema: z.string().default("public").describe("Schema name"),
-    },
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  },
-  async ({ table, schema }) => {
-    try {
-      const result = await executeQuery(
-        `SELECT
-          i.indexname,
-          i.indexdef,
-          pg_size_pretty(pg_relation_size(quote_ident(i.schemaname) || '.' || quote_ident(i.indexname))) AS index_size,
-          COALESCE(s.idx_scan, 0) AS scan_count,
-          COALESCE(s.idx_tup_read, 0) AS tuples_read,
-          COALESCE(s.idx_tup_fetch, 0) AS tuples_fetched
-        FROM pg_indexes i
-        LEFT JOIN pg_stat_user_indexes s
-          ON i.schemaname = s.schemaname AND i.indexname = s.indexrelname
-        WHERE i.schemaname = $2 AND i.tablename = $1
-        ORDER BY COALESCE(s.idx_scan, 0) DESC`,
-        [table, schema]
-      );
-
-      if (result.rows.length === 0) {
-        return {
-          content: [{ type: "text", text: `No indexes found for '${schema}.${table}'.` }],
-        };
+    httpServer.listen(PORT, "0.0.0.0", () => {
+      console.error(`[postgres-mcp] HTTP server running on port ${PORT}`);
+      console.error(`[postgres-mcp] Endpoint: http://0.0.0.0:${PORT}/mcp`);
+      console.error(`[postgres-mcp] Health:   http://0.0.0.0:${PORT}/health`);
+      console.error(`[postgres-mcp] Active DB: ${activeDbName}`);
+      console.error(`[postgres-mcp] Connections: ${Object.keys(allConnections).join(", ")}`);
+      if (MCP_TOKEN) {
+        console.error(`[postgres-mcp] Auth: Bearer token enabled`);
+      } else {
+        console.error(`[postgres-mcp] Auth: DISABLED (set MCP_TOKEN to enable)`);
       }
+    });
 
-      const lines = [
-        `# Indexes on ${schema}.${table}`,
-        "",
-        `Found ${result.rows.length} indexes:`,
-        "",
-      ];
-
-      for (const idx of result.rows) {
-        lines.push(`### ${idx.indexname}`);
-        lines.push(`- **Size:** ${idx.index_size}`);
-        lines.push(`- **Scans:** ${Number(idx.scan_count).toLocaleString()}`);
-        lines.push(`- **Tuples read:** ${Number(idx.tuples_read).toLocaleString()}`);
-        lines.push(`- **Definition:** \`${idx.indexdef}\``);
-        lines.push("");
-      }
-
-      return { content: [{ type: "text", text: lines.join("\n") }] };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: "text", text: `Error: ${msg}` }],
-        isError: true,
-      };
-    }
+  } else {
+    // -------------------------------------------------------------------------
+    // stdio mode — local use with Claude Code / Claude Desktop
+    // -------------------------------------------------------------------------
+    const mcpServer = new McpServer({
+      name: "postgres-mcp-server",
+      version: "2.0.0",
+    });
+    registerAllTools(mcpServer);
+    const transport = new StdioServerTransport();
+    await mcpServer.connect(transport);
+    console.error(`[postgres-mcp] Running on stdio | Active DB: ${activeDbName}`);
   }
-);
-
-// ============================================================================
-// Start Server
-// ============================================================================
-
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("PostgreSQL MCP Server running on stdio");
 }
 
 main().catch((error) => {
-  console.error("Fatal error:", error);
+  console.error("[postgres-mcp] Fatal error:", error);
   process.exit(1);
 });
 
-// Graceful shutdown
-process.on("SIGINT", async () => {
-  await pool.end();
+// Graceful shutdown — close all connection pools
+async function shutdown() {
+  console.error("[postgres-mcp] Shutting down...");
+  for (const pool of poolCache.values()) {
+    await pool.end().catch(() => {});
+  }
   process.exit(0);
-});
+}
 
-process.on("SIGTERM", async () => {
-  await pool.end();
-  process.exit(0);
-});
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
