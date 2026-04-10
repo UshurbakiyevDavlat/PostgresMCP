@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { Pool } from "pg";
 import { z } from "zod";
 import * as fs from "fs";
@@ -8,7 +9,7 @@ import * as path from "path";
 import * as http from "http";
 import { fileURLToPath } from "url";
 import { randomUUID } from "crypto";
-import type { IncomingMessage } from "http";
+import type { IncomingMessage, ServerResponse } from "http";
 
 // ============================================================================
 // PostgreSQL MCP Server v2
@@ -713,109 +714,128 @@ async function main(): Promise<void> {
 
   if (transport_mode === "http") {
     // -------------------------------------------------------------------------
-    // HTTP mode — Streamable HTTP transport for cloud/remote deployment
-    // Endpoint: POST/GET/DELETE /mcp
-    // Health:   GET /health
-    // Auth:     Bearer token via MCP_TOKEN env (optional)
+    // HTTP mode — dual transport for maximum compatibility:
+    //   /sse      — SSE transport  (Cowork, older Claude Code)
+    //   /messages — SSE POST handler
+    //   /mcp      — Streamable HTTP (Claude Code CLI, modern clients)
+    //   /health   — health check (no auth)
+    //
+    // Auth: ?token=xxx  OR  Authorization: Bearer xxx
     // -------------------------------------------------------------------------
     const PORT = parseInt(process.env.PORT ?? "3200");
     const MCP_TOKEN = process.env.MCP_TOKEN;
 
-    // Session map: mcp-session-id → transport
-    const transports = new Map<string, StreamableHTTPServerTransport>();
+    // SSE sessions: sessionId → SSEServerTransport
+    const sseSessions = new Map<string, SSEServerTransport>();
+    // Streamable HTTP sessions: mcp-session-id → StreamableHTTPServerTransport
+    const httpSessions = new Map<string, StreamableHTTPServerTransport>();
+
+    // -- Auth helper --
+    function checkToken(reqUrl: URL, req: IncomingMessage, res: ServerResponse): boolean {
+      if (!MCP_TOKEN) return true;
+      const queryToken = reqUrl.searchParams.get("token") ?? "";
+      const bearerToken = (req.headers["authorization"] ?? "")
+        .replace(/^Bearer\s+/i, "").trim();
+      if ((queryToken || bearerToken) === MCP_TOKEN) return true;
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return false;
+    }
 
     const httpServer = http.createServer(async (req, res) => {
       const reqUrl = new URL(req.url ?? "/", `http://localhost`);
 
-      // -- Health check (no auth) --
+      // ── Health check (no auth) ──────────────────────────────────────────────
       if (reqUrl.pathname === "/health" && req.method === "GET") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           status: "ok",
           activeDb: activeDbName,
           connections: Object.keys(allConnections),
-          sessions: transports.size,
+          sseSessions: sseSessions.size,
+          httpSessions: httpSessions.size,
         }));
         return;
       }
 
-      // -- Token auth (second line of defence after nginx) --
-      // Accepts: ?token=xxx (query param, same as knowledge-agent pattern)
-      //       OR Authorization: Bearer xxx (header, standard MCP clients)
-      if (MCP_TOKEN) {
-        const queryToken = reqUrl.searchParams.get("token") ?? "";
-        const bearerToken = (req.headers["authorization"] ?? "")
-          .replace(/^Bearer\s+/i, "")
-          .trim();
-        const token = queryToken || bearerToken;
+      if (!checkToken(reqUrl, req, res)) return;
 
-        if (token !== MCP_TOKEN) {
-          res.writeHead(401, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Unauthorized" }));
-          return;
-        }
+      // ── SSE transport: GET /sse ─────────────────────────────────────────────
+      // Used by Cowork and older Claude Code versions
+      if (reqUrl.pathname === "/sse" && req.method === "GET") {
+        const transport = new SSEServerTransport("/messages", res);
+        sseSessions.set(transport.sessionId, transport);
+
+        res.on("close", () => {
+          sseSessions.delete(transport.sessionId);
+          console.error(`[postgres-mcp] SSE session closed: ${transport.sessionId}`);
+        });
+
+        const mcpServer = new McpServer({ name: "postgres-mcp-server", version: "2.0.0" });
+        registerAllTools(mcpServer);
+        await mcpServer.connect(transport);
+        console.error(`[postgres-mcp] SSE session opened: ${transport.sessionId} | db: ${activeDbName}`);
+        return;
       }
 
-      // -- MCP endpoint --
+      // ── SSE transport: POST /messages ───────────────────────────────────────
+      if (reqUrl.pathname === "/messages" && req.method === "POST") {
+        const sessionId = reqUrl.searchParams.get("sessionId") ?? "";
+        const transport = sseSessions.get(sessionId);
+        if (!transport) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "SSE session not found" }));
+          return;
+        }
+        let parsedBody: unknown;
+        try { parsedBody = await parseBody(req); } catch {
+          res.writeHead(400); res.end("Invalid JSON"); return;
+        }
+        await transport.handlePostMessage(req, res, parsedBody);
+        return;
+      }
+
+      // ── Streamable HTTP transport: /mcp ─────────────────────────────────────
+      // Used by Claude Code CLI with --transport http
       if (reqUrl.pathname === "/mcp") {
         const sessionId = req.headers["mcp-session-id"] as string | undefined;
         let transport: StreamableHTTPServerTransport;
 
-        if (sessionId && transports.has(sessionId)) {
-          // Existing session — reuse transport
-          transport = transports.get(sessionId)!;
+        if (sessionId && httpSessions.has(sessionId)) {
+          transport = httpSessions.get(sessionId)!;
 
         } else if (!sessionId && req.method === "POST") {
-          // New session initialization (no session ID = first request)
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
           });
-
           transport.onclose = () => {
             const sid = transport.sessionId;
-            if (sid) transports.delete(sid);
-            console.error(`[postgres-mcp] Session closed: ${sid}`);
+            if (sid) httpSessions.delete(sid);
           };
-
-          const mcpServer = new McpServer({
-            name: "postgres-mcp-server",
-            version: "2.0.0",
-          });
+          const mcpServer = new McpServer({ name: "postgres-mcp-server", version: "2.0.0" });
           registerAllTools(mcpServer);
           await mcpServer.connect(transport);
-
           const sid = transport.sessionId;
-          if (sid) {
-            transports.set(sid, transport);
-            console.error(`[postgres-mcp] New session: ${sid} | db: ${activeDbName}`);
-          }
+          if (sid) httpSessions.set(sid, transport);
+          console.error(`[postgres-mcp] HTTP session opened: ${sid} | db: ${activeDbName}`);
 
-        } else if (sessionId && !transports.has(sessionId)) {
-          // Session ID present but unknown — server likely restarted, client must reinitialize
-          console.error(`[postgres-mcp] Unknown session: ${sessionId} — asking client to reinitialize`);
+        } else if (sessionId && !httpSessions.has(sessionId)) {
           res.writeHead(404, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Session not found. Please reinitialize." }));
           return;
 
         } else {
-          // e.g. GET without session ID — invalid
           res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Bad Request: POST required for initialization" }));
+          res.end(JSON.stringify({ error: "Bad Request" }));
           return;
         }
 
-        // Parse body for POST requests
         let parsedBody: unknown;
         if (req.method === "POST") {
-          try {
-            parsedBody = await parseBody(req);
-          } catch {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Invalid JSON body" }));
-            return;
+          try { parsedBody = await parseBody(req); } catch {
+            res.writeHead(400); res.end("Invalid JSON"); return;
           }
         }
-
         await transport.handleRequest(req, res, parsedBody);
         return;
       }
@@ -825,16 +845,11 @@ async function main(): Promise<void> {
     });
 
     httpServer.listen(PORT, "0.0.0.0", () => {
-      console.error(`[postgres-mcp] HTTP server running on port ${PORT}`);
-      console.error(`[postgres-mcp] Endpoint: http://0.0.0.0:${PORT}/mcp`);
-      console.error(`[postgres-mcp] Health:   http://0.0.0.0:${PORT}/health`);
-      console.error(`[postgres-mcp] Active DB: ${activeDbName}`);
-      console.error(`[postgres-mcp] Connections: ${Object.keys(allConnections).join(", ")}`);
-      if (MCP_TOKEN) {
-        console.error(`[postgres-mcp] Auth: Bearer token enabled`);
-      } else {
-        console.error(`[postgres-mcp] Auth: DISABLED (set MCP_TOKEN to enable)`);
-      }
+      console.error(`[postgres-mcp] Running on port ${PORT}`);
+      console.error(`[postgres-mcp] SSE endpoint:  http://0.0.0.0:${PORT}/sse   ← Cowork`);
+      console.error(`[postgres-mcp] HTTP endpoint: http://0.0.0.0:${PORT}/mcp   ← Claude Code CLI`);
+      console.error(`[postgres-mcp] Health:        http://0.0.0.0:${PORT}/health`);
+      console.error(`[postgres-mcp] Active DB: ${activeDbName} | Auth: ${MCP_TOKEN ? "enabled" : "DISABLED"}`);
     });
 
   } else {
