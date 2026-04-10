@@ -758,7 +758,9 @@ async function main(): Promise<void> {
         return;
       }
 
-      if (!checkToken(reqUrl, req, res)) return;
+      // /messages не требует токена — sessionId сам по себе авторизует
+      const isMessagesEndpoint = reqUrl.pathname === "/messages";
+      if (!isMessagesEndpoint && !checkToken(reqUrl, req, res)) return;
 
       // ── SSE transport: GET /sse ─────────────────────────────────────────────
       // Used by Cowork and older Claude Code versions
