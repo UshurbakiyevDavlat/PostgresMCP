@@ -1,6 +1,6 @@
 # Deployment Guide — PostgreSQL MCP Server
 
-Deploy to Hetzner CAX11 (`204.168.250.116`) — same server as knowledge-agent and linkedin-mcp.
+Deploy to any VPS with Node.js 18+, nginx, and systemd.
 
 ---
 
@@ -10,21 +10,20 @@ Deploy to Hetzner CAX11 (`204.168.250.116`) — same server as knowledge-agent a
 | --- | --- |
 | Server path | `/opt/PostgresMCP/` |
 | Port (internal) | `3200` |
-| Domain | `davlat-postgres.duckdns.org` |
-| MCP endpoint | `https://davlat-postgres.duckdns.org/mcp` |
-| Health check | `https://davlat-postgres.duckdns.org/health` |
+| Domain | `YOUR_DOMAIN` |
+| MCP endpoint | `https://YOUR_DOMAIN/mcp` |
+| Health check | `https://YOUR_DOMAIN/health` |
 | systemd service | `postgres-mcp` |
 
 ---
 
-## Step 1 — DuckDNS subdomain
+## Step 1 — Point your domain to the VPS
 
-Open https://www.duckdns.org and add a new subdomain: **`davlat-postgres`**
-Point it to `204.168.250.116` (same IP as your other MCPs).
+Configure your DNS provider to point your domain to the VPS IP address.
 
 Verify:
 ```bash
-ping davlat-postgres.duckdns.org
+ping YOUR_DOMAIN
 ```
 
 ---
@@ -32,9 +31,9 @@ ping davlat-postgres.duckdns.org
 ## Step 2 — Clone repo on VPS
 
 ```bash
-ssh root@204.168.250.116
+ssh root@YOUR_VPS_IP
 
-git clone https://github.com/UshurbakiyevDavlat/postgres-mcp-server /opt/PostgresMCP
+git clone https://github.com/YOUR_USERNAME/postgres-mcp-server /opt/PostgresMCP
 cd /opt/PostgresMCP
 ```
 
@@ -75,12 +74,11 @@ This file stays on the server only — **never commit it to git**.
 ```bash
 cat > /opt/PostgresMCP/connections.json << 'EOF'
 {
-  "knowledge": "postgresql://agent:agentpass@localhost:5432/knowledge"
+  "mydb": "postgresql://user:password@localhost:5432/mydb"
 }
 EOF
 ```
 
-> The `knowledge` database is the existing pgvector DB running in Docker on this server.
 > To add more DBs later, just add entries here and restart the service — no code changes needed.
 
 ---
@@ -95,7 +93,7 @@ echo "Your MCP_TOKEN: $TOKEN"   # save this somewhere!
 cat > /opt/PostgresMCP/.env << EOF
 TRANSPORT=http
 PORT=3200
-DEFAULT_DB=knowledge
+DEFAULT_DB=mydb
 MCP_TOKEN=$TOKEN
 EOF
 ```
@@ -124,8 +122,7 @@ Expected output:
 ```
 [postgres-mcp] HTTP server running on port 3200
 [postgres-mcp] Endpoint: http://0.0.0.0:3200/mcp
-[postgres-mcp] Active DB: knowledge
-[postgres-mcp] Connections: knowledge
+[postgres-mcp] Active DB: mydb
 [postgres-mcp] Auth: Bearer token enabled
 ```
 
@@ -138,17 +135,15 @@ cp /opt/PostgresMCP/deploy/nginx-postgres-mcp.conf /etc/nginx/sites-available/po
 ln -s /etc/nginx/sites-available/postgres-mcp /etc/nginx/sites-enabled/postgres-mcp
 ```
 
-**Важно:** вставь токен в nginx конфиг перед проверкой:
+Insert the token into the nginx config before testing:
 ```bash
-# Токен должен совпадать с MCP_TOKEN из .env
 YOUR_TOKEN=$(grep MCP_TOKEN /opt/PostgresMCP/.env | cut -d= -f2)
-
 sed -i "s/REPLACE_WITH_YOUR_TOKEN/$YOUR_TOKEN/g" /etc/nginx/sites-available/postgres-mcp
 ```
 
-Проверить что токен подставился:
+Replace the domain placeholder:
 ```bash
-grep arg_token /etc/nginx/sites-available/postgres-mcp
+sed -i "s/YOUR_DOMAIN/your.actual.domain/g" /etc/nginx/sites-available/postgres-mcp
 ```
 
 ```bash
@@ -164,7 +159,7 @@ systemctl reload nginx
 ## Step 9 — SSL certificate with certbot
 
 ```bash
-certbot --nginx -d davlat-postgres.duckdns.org
+certbot --nginx -d YOUR_DOMAIN
 ```
 
 Certbot will:
@@ -183,15 +178,15 @@ systemctl status certbot.timer
 
 ```bash
 # Health check (no auth needed)
-curl https://davlat-postgres.duckdns.org/health
-# Expected: {"status":"ok","activeDb":"knowledge","connections":["knowledge"],"sessions":0}
+curl https://YOUR_DOMAIN/health
+# Expected: {"status":"ok","activeDb":"mydb","connections":["mydb"],"sessions":0}
 
 # Test auth rejection
-curl https://davlat-postgres.duckdns.org/mcp -X POST -H "Content-Type: application/json" -d '{}'
+curl https://YOUR_DOMAIN/mcp -X POST -H "Content-Type: application/json" -d '{}'
 # Expected: 401 Unauthorized
 
 # Test with token
-curl https://davlat-postgres.duckdns.org/mcp \
+curl https://YOUR_DOMAIN/mcp \
   -X POST \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_MCP_TOKEN" \
@@ -204,8 +199,7 @@ curl https://davlat-postgres.duckdns.org/mcp \
 ## Step 11 — Add to Claude Code (local)
 
 ```powershell
-# Токен передаётся как query param — так же как у knowledge-agent и linkedin-mcp
-claude mcp add --transport http postgres-mcp "https://davlat-postgres.duckdns.org/mcp?token=YOUR_MCP_TOKEN"
+claude mcp add --transport http postgres-mcp "https://YOUR_DOMAIN/mcp?token=YOUR_MCP_TOKEN"
 ```
 
 ---
@@ -231,20 +225,18 @@ systemctl status postgres-mcp
 No code changes needed — just edit `connections.json` and restart:
 
 ```bash
-# Edit the file
 nano /opt/PostgresMCP/connections.json
 
-# Example — add mps_prod:
+# Example:
 # {
-#   "knowledge": "postgresql://agent:agentpass@localhost:5432/knowledge",
-#   "mps_prod": "postgresql://user:pass@10.0.0.1:5432/mps"
+#   "mydb": "postgresql://user:pass@localhost:5432/mydb",
+#   "analytics": "postgresql://user:pass@localhost:5432/analytics"
 # }
 
-# Restart to pick up changes
 systemctl restart postgres-mcp
 ```
 
-Then in Claude: `pg_list_connections` → `pg_use_connection("mps_prod")` → query away.
+Then in Claude: `pg_list_connections` → `pg_use_connection("analytics")` → query away.
 
 ---
 
@@ -271,11 +263,8 @@ journalctl -u postgres-mcp -n 30
 
 **Cannot connect to PostgreSQL**
 ```bash
-# Verify the Docker container is running
-docker ps | grep pgvector
-
 # Test the connection string directly
-psql postgresql://agent:agentpass@localhost:5432/knowledge -c "SELECT 1"
+psql postgresql://user:password@localhost:5432/mydb -c "SELECT 1"
 ```
 
 **nginx 502 Bad Gateway**
