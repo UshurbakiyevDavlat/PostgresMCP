@@ -764,8 +764,9 @@ async function main(): Promise<void> {
         if (sessionId && transports.has(sessionId)) {
           // Existing session — reuse transport
           transport = transports.get(sessionId)!;
+
         } else if (!sessionId && req.method === "POST") {
-          // New session — initialize
+          // New session initialization (no session ID = first request)
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
           });
@@ -788,9 +789,18 @@ async function main(): Promise<void> {
             transports.set(sid, transport);
             console.error(`[postgres-mcp] New session: ${sid} | db: ${activeDbName}`);
           }
+
+        } else if (sessionId && !transports.has(sessionId)) {
+          // Session ID present but unknown — server likely restarted, client must reinitialize
+          console.error(`[postgres-mcp] Unknown session: ${sessionId} — asking client to reinitialize`);
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Session not found. Please reinitialize." }));
+          return;
+
         } else {
+          // e.g. GET without session ID — invalid
           res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Bad Request: provide mcp-session-id header for existing sessions" }));
+          res.end(JSON.stringify({ error: "Bad Request: POST required for initialization" }));
           return;
         }
 
